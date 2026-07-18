@@ -77,31 +77,10 @@ static uint8_t battery_percent = 0;
 static bool display_on = true;
 static uint32_t display_idle_ms = 0;
 static uint32_t sleep_count = 0;
-static uint32_t wake_count = 0;
 
 static const char *weekday_names[] = {
     "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
 };
-
-static const char *wakeup_cause_to_str(esp_sleep_wakeup_cause_t cause)
-{
-    switch (cause) {
-        case ESP_SLEEP_WAKEUP_UNDEFINED:    return "UNDEFINED";
-        case ESP_SLEEP_WAKEUP_ALL:          return "ALL";
-        case ESP_SLEEP_WAKEUP_EXT0:         return "EXT0";
-        case ESP_SLEEP_WAKEUP_EXT1:         return "EXT1";
-        case ESP_SLEEP_WAKEUP_TIMER:        return "TIMER";
-        case ESP_SLEEP_WAKEUP_TOUCHPAD:     return "TOUCHPAD";
-        case ESP_SLEEP_WAKEUP_ULP:          return "ULP";
-        case ESP_SLEEP_WAKEUP_GPIO:         return "GPIO";
-        case ESP_SLEEP_WAKEUP_UART:         return "UART";
-        case ESP_SLEEP_WAKEUP_WIFI:         return "WIFI";
-        case ESP_SLEEP_WAKEUP_COCPU:        return "COCPU";
-        case ESP_SLEEP_WAKEUP_COCPU_TRAP_TRIG: return "COCPU_TRIG";
-        case ESP_SLEEP_WAKEUP_BT:           return "BT";
-        default:                            return "UNKNOWN";
-    }
-}
 
 static void log_task_stats(const char *task_name)
 {
@@ -114,9 +93,9 @@ static void log_task_stats(const char *task_name)
 
 static void log_display_state(const char *context)
 {
-    ESP_LOGD(TAG, "  [display_state] on=%d idle_ms=%lu sleep_count=%lu wake_count=%lu",
+    ESP_LOGD(TAG, "  [display_state] on=%d idle_ms=%lu sleep_count=%lu",
              display_on, (unsigned long)display_idle_ms,
-             (unsigned long)sleep_count, (unsigned long)wake_count);
+             (unsigned long)sleep_count);
     ESP_LOGD(TAG, "  [lvgl_ptrs] time=%p date=%p status=%p notif=%p batt=%p",
              (void*)lbl_time, (void*)lbl_date, (void*)lbl_status,
              (void*)lbl_notification, (void*)lbl_battery);
@@ -551,45 +530,18 @@ static void display_manager_task(void *pv) {
             display_off_action();
         }
 
-        /* If display is off, enter light sleep */
+        /* If display is off, just wait (backlight already off = low power) */
         if (!display_on) {
-            ESP_LOGI(TAG, "[display_mgr] display OFF, preparing light sleep...");
-            log_display_state("pre_sleep");
-
-            ESP_LOGI(TAG, "[display_mgr] calling lvgl_port_stop()...");
-            esp_err_t stop_ret = lvgl_port_stop();
-            ESP_LOGI(TAG, "[display_mgr] lvgl_port_stop returned: %s", esp_err_to_name(stop_ret));
-
-            gpio_wakeup_enable(BOOT_WAKEUP_GPIO, GPIO_INTR_LOW_LEVEL);
-            esp_sleep_enable_gpio_wakeup();
-            esp_sleep_enable_timer_wakeup(60000000ULL); /* 60s periodic wake */
-            esp_sleep_enable_bt_wakeup();
-
             sleep_count++;
-            ESP_LOGI(TAG, "[display_mgr] entering light sleep (sleep #%lu)...", (unsigned long)sleep_count);
-            int64_t sleep_start = esp_timer_get_time();
-
-            esp_light_sleep_start();
-
-            int64_t sleep_end = esp_timer_get_time();
-            int64_t sleep_us = sleep_end - sleep_start;
-            ESP_LOGI(TAG, "[display_mgr] woke from light sleep (slept %lld ms)", sleep_us / 1000);
-
-            ESP_LOGI(TAG, "[display_mgr] calling lvgl_port_resume()...");
-            esp_err_t resume_ret = lvgl_port_resume();
-            ESP_LOGI(TAG, "[display_mgr] lvgl_port_resume returned: %s", esp_err_to_name(resume_ret));
-
-            wake_count++;
-            esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-            ESP_LOGI(TAG, "[display_mgr] wake cause=%d (%s) wake #%lu",
-                     cause, wakeup_cause_to_str(cause), (unsigned long)wake_count);
-
-            /* Always turn on display on any wake */
-            ESP_LOGI(TAG, "[display_mgr] turning display ON after wake");
-            display_on_action();
+            ESP_LOGD(TAG, "[display_mgr] display OFF, waiting... (sleep #%lu)", (unsigned long)sleep_count);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(250));
+            display_idle_ms += 250;
+            if (display_idle_ms % 5000 == 0) {
+                ESP_LOGD(TAG, "[display_mgr] idle=%lu/%d ms", (unsigned long)display_idle_ms, DISPLAY_IDLE_TIMEOUT_MS);
+            }
         }
-
-        vTaskDelay(pdMS_TO_TICKS(250));
         if (display_on) {
             display_idle_ms += 250;
             if (display_idle_ms % 5000 == 0) {
@@ -654,10 +606,6 @@ extern "C" void app_main(void)
         default:                 reason_str = "UNKNOWN"; break;
     }
     ESP_LOGI(TAG, "Reset reason: %s (0x%x)", reason_str, reset_reason);
-
-    /* Wakeup cause */
-    esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
-    ESP_LOGI(TAG, "Wakeup cause: %s (0x%x)", wakeup_cause_to_str(wakeup_cause), wakeup_cause);
 
     /* Brazil timezone */
     ESP_LOGI(TAG, "Setting timezone: BRT3");
