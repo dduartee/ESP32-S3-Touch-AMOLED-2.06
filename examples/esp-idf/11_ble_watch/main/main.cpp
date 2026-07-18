@@ -19,6 +19,7 @@
 #include "sdkconfig.h"
 
 #include "lvgl.h"
+#include "esp_lvgl_port.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
 
@@ -324,10 +325,11 @@ static void update_rtc_display(void)
 }
 
 static void display_off_action(void) {
-    display_on = false;
     bsp_display_lock(0);
     lv_obj_clean(lv_screen_active());
+    lbl_time = lbl_date = lbl_status = lbl_notification = lbl_battery = NULL;
     bsp_display_unlock();
+    display_on = false;
     bsp_display_backlight_off();
     ESP_LOGI(TAG, "Display OFF");
 }
@@ -431,6 +433,8 @@ static void display_manager_task(void *pv) {
 
         /* If display is off, enter light sleep */
         if (!display_on) {
+            lvgl_port_stop();
+
             gpio_wakeup_enable(BOOT_WAKEUP_GPIO, GPIO_INTR_LOW_LEVEL);
             esp_sleep_enable_gpio_wakeup();
             esp_sleep_enable_timer_wakeup(60000000ULL); /* 60s periodic wake */
@@ -438,6 +442,8 @@ static void display_manager_task(void *pv) {
 
             ESP_LOGI(TAG, "Entering light sleep...");
             esp_light_sleep_start();
+
+            lvgl_port_resume();
 
             esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
             ESP_LOGI(TAG, "Woke from light sleep: cause=%d", cause);
@@ -463,11 +469,11 @@ static void update_battery_display(void) {
 static void rtc_update_task(void *pv) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        if (display_on) {
+        if (display_on && lbl_time) {
             bsp_display_lock(0);
-            update_rtc_display();
-            update_status_display();
-            update_battery_display();
+            if (lbl_time) update_rtc_display();
+            if (lbl_status) update_status_display();
+            if (lbl_battery) update_battery_display();
             bsp_display_unlock();
         }
     }
