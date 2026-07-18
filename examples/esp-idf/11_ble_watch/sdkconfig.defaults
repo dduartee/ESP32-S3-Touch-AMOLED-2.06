@@ -36,8 +36,7 @@ CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
 CONFIG_BT_NIMBLE_GATT_SERVER=y
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=256
 
-# Power Management
-CONFIG_PM_ENABLE=y
+# Light sleep idle threshold (display off manages sleep manually)
 CONFIG_FREERTOS_IDLE_TIME_BEFORE_SLEEP=3
 
 # Increase main task stack for BLE + LVGL
