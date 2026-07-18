@@ -26,17 +26,18 @@
 #include "XPowersLib.h"
 
 #include "pcf85063.h"
+#include "bt_nus.h"
 
-#define TAG "basic_watch"
+#define TAG "ble_watch"
 
-#define AWAKE_TIME_MS       5000  /* 5 seconds awake before deep sleep */
+#define DISPLAY_IDLE_TIMEOUT_MS 10000
+#define HEARTBEAT_INTERVAL_MS   2000
+#define BOOT_WAKEUP_GPIO       GPIO_NUM_0
 
 #define I2C_MASTER_TIMEOUT_MS 1000
 
 #define NVS_NAMESPACE "storage"
 #define NVS_KEY_BOOT_COUNT "boot_count"
-
-#define WAKEUP_GPIO GPIO_NUM_0
 
 #define WIFI_SSID     "gaabe"
 #define WIFI_PASS     "tetetectec"
@@ -68,6 +69,10 @@ static pcf85063_config_t rtc_cfg = {
 static lv_obj_t *lbl_time;
 static lv_obj_t *lbl_date;
 static lv_obj_t *lbl_status;
+static lv_obj_t *lbl_notification = NULL;
+
+static bool display_on = true;
+static uint32_t display_idle_ms = 0;
 
 static const char *weekday_names[] = {
     "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
@@ -283,10 +288,16 @@ static void create_ui(void)
     lv_obj_align(lbl_date, LV_ALIGN_CENTER, 0, 0);
 
     lbl_status = lv_label_create(scr);
-    lv_label_set_text(lbl_status, "Deep Sleep - Press BOOT to wake");
+    lv_label_set_text(lbl_status, "Advertising");
     lv_obj_set_style_text_font(lbl_status, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl_status, lv_color_hex(0x666666), LV_PART_MAIN);
     lv_obj_align(lbl_status, LV_ALIGN_CENTER, 0, 50);
+
+    lbl_notification = lv_label_create(scr);
+    lv_label_set_text(lbl_notification, "Waiting for notifications...");
+    lv_obj_set_style_text_font(lbl_notification, &lv_font_montserrat_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_notification, lv_color_hex(0x00FF00), LV_PART_MAIN);
+    lv_obj_align(lbl_notification, LV_ALIGN_CENTER, 0, 80);
 }
 
 static void update_rtc_display(void)
@@ -304,36 +315,164 @@ static void update_rtc_display(void)
     lv_label_set_text(lbl_date, buf);
 }
 
+static void display_off_action(void) {
+    bsp_display_lock(0);
+    lv_obj_clean(lv_screen_active());
+    bsp_display_unlock();
+    bsp_display_backlight_off();
+    display_on = false;
+    ESP_LOGI(TAG, "Display OFF");
+}
+
+static void display_on_action(void) {
+    bsp_display_backlight_on();
+    bsp_display_lock(0);
+    create_ui();
+    update_rtc_display();
+    bsp_display_unlock();
+    display_on = true;
+    display_idle_ms = 0;
+    ESP_LOGI(TAG, "Display ON");
+}
+
+static void update_status_display(void) {
+    if (!lbl_status) return;
+    const char *ble_state = bt_nus_is_connected() ? "Connected" : "Advertising";
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s", ble_state);
+    lv_label_set_text(lbl_status, buf);
+}
+
+static void show_notification(const char *msg) {
+    if (!lbl_notification) return;
+    lv_label_set_text(lbl_notification, msg);
+}
+
+static void button_task(void *pv) {
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << BOOT_WAKEUP_GPIO),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+    };
+    gpio_config(&btn_cfg);
+
+    int debounce = 0;
+    bool prev_raw = true;
+    bool pressed = false;
+
+    while (1) {
+        bool raw = gpio_get_level(BOOT_WAKEUP_GPIO);
+        if (raw == prev_raw) {
+            debounce = 0;
+        } else {
+            debounce++;
+            if (debounce >= 3) {
+                debounce = 0;
+                prev_raw = raw;
+                if (!raw && !pressed) {
+                    pressed = true;
+                    ESP_LOGI(TAG, "BOOT button pressed");
+                    if (bt_nus_is_connected()) {
+                        bt_nus_send((const uint8_t *)">cmd:btn_press\n", 15);
+                    }
+                    display_on_action();
+                } else if (raw) {
+                    pressed = false;
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
+static void ble_heartbeat_task(void *pv) {
+    uint32_t count = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));
+        count++;
+        if (bt_nus_is_connected()) {
+            char buf[64];
+            int len = snprintf(buf, sizeof(buf), ">NUS alive count=%lu\n", (unsigned long)count);
+            bt_nus_send((const uint8_t *)buf, len);
+        }
+    }
+}
+
+static void display_manager_task(void *pv) {
+    while (1) {
+        /* Check for NUS RX messages */
+        const char *rx = bt_nus_last_rx();
+        if (rx != NULL) {
+            ESP_LOGI(TAG, "Notification: %s", rx);
+            char display_buf[256];
+            snprintf(display_buf, sizeof(display_buf), "%s", rx);
+            show_notification(display_buf);
+            if (!display_on) {
+                display_on_action();
+            }
+            display_idle_ms = 0;
+        }
+
+        /* Check if display should turn off */
+        if (display_on && display_idle_ms >= DISPLAY_IDLE_TIMEOUT_MS) {
+            display_off_action();
+        }
+
+        /* If display is off, enter light sleep */
+        if (!display_on) {
+            gpio_wakeup_enable(BOOT_WAKEUP_GPIO, GPIO_INTR_LOW_LEVEL);
+            esp_sleep_enable_gpio_wakeup();
+            esp_sleep_enable_timer_wakeup(60000000ULL); /* 60s periodic wake */
+
+            ESP_LOGI(TAG, "Entering light sleep...");
+            esp_light_sleep_start();
+
+            esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+            ESP_LOGI(TAG, "Woke from light sleep: cause=%d", cause);
+
+            /* Always turn on display on any wake */
+            display_on_action();
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(250));
+        if (display_on) {
+            display_idle_ms += 250;
+        }
+    }
+}
+
+static void rtc_update_task(void *pv) {
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (display_on) {
+            bsp_display_lock(0);
+            update_rtc_display();
+            update_status_display();
+            bsp_display_unlock();
+        }
+    }
+}
+
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "Deep Sleep Boot Example");
+    ESP_LOGI(TAG, "  BLE Watch (Light Sleep)");
     ESP_LOGI(TAG, "========================================");
 
+    /* Reset reason */
     esp_reset_reason_t reset_reason = esp_reset_reason();
-    ESP_LOGI(TAG, "Reset reason: %s", reset_reason == ESP_RST_POWERON   ? "POWERON" :
-                                       reset_reason == ESP_RST_EXT       ? "EXT" :
-                                       reset_reason == ESP_RST_SW        ? "SW" :
-                                       reset_reason == ESP_RST_PANIC     ? "PANIC" :
-                                       reset_reason == ESP_RST_INT_WDT   ? "INT_WDT" :
-                                       reset_reason == ESP_RST_TASK_WDT  ? "TASK_WDT" :
-                                       reset_reason == ESP_RST_WDT       ? "WDT" :
-                                       reset_reason == ESP_RST_DEEPSLEEP ? "DEEPSLEEP" :
-                                       reset_reason == ESP_RST_BROWNOUT  ? "BROWNOUT" :
-                                       reset_reason == ESP_RST_SDIO      ? "SDIO" :
-                                       reset_reason == ESP_RST_USB       ? "USB" :
-                                       reset_reason == ESP_RST_JTAG      ? "JTAG" :
-                                       reset_reason == ESP_RST_EFUSE     ? "EFUSE" :
-                                       reset_reason == ESP_RST_PWR_GLITCH? "PWR_GLITCH" :
-                                       reset_reason == ESP_RST_CPU_LOCKUP? "CPU_LOCKUP" : "UNKNOWN");
+    ESP_LOGI(TAG, "Reset reason: %d", reset_reason);
 
+    /* Wakeup cause */
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "Wakeup cause: %s (0x%x)", wakeup_cause_to_str(wakeup_cause), wakeup_cause);
 
-    /* Set Brazil timezone (BRT = UTC-3, no DST since 2019) */
+    /* Brazil timezone */
     setenv("TZ", "BRT3", 1);
     tzset();
 
+    /* NVS */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -341,11 +480,10 @@ extern "C" void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    /* Boot counter */
     nvs_handle_t nvs_handle;
     ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(ret));
-    } else {
+    if (ret == ESP_OK) {
         int32_t boot_count = 0;
         nvs_get_i32(nvs_handle, NVS_KEY_BOOT_COUNT, &boot_count);
         boot_count++;
@@ -355,15 +493,15 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "Boot count: %ld", (long)boot_count);
     }
 
-    /* Initialize display — this also initializes the BSP I2C bus on GPIO 14/15 */
+    /* Display */
     bsp_display_start();
     ESP_LOGI(TAG, "Display initialized");
 
-    /* Add AXP2101 PMU to the BSP's existing I2C bus (avoids GPIO 14/15 conflict) */
+    /* PMU */
     ESP_ERROR_CHECK(i2c_init_pmu());
     ESP_LOGI(TAG, "PMU I2C device added");
 
-    /* Initialize PCF85063 RTC */
+    /* RTC */
     rtc_cfg.i2c_bus = bsp_i2c_get_handle();
     esp_err_t rtc_ret = pcf85063_init(&rtc_cfg);
     if (rtc_ret != ESP_OK) {
@@ -372,49 +510,40 @@ extern "C" void app_main(void)
         ESP_LOGI(TAG, "PCF85063 RTC initialized");
     }
 
-    /* Create LVGL UI and show initial time */
+    /* LVGL UI */
     bsp_display_lock(0);
     create_ui();
     update_rtc_display();
     bsp_display_unlock();
 
-    /* AXP2101 battery status */
+    /* AXP2101 battery */
     XPowersPMU PMU;
     if (!PMU.begin(AXP2101_SLAVE_ADDRESS, pmu_register_read, pmu_register_write_byte)) {
         ESP_LOGE(TAG, "AXP2101 init failed");
     } else {
-        ESP_LOGI(TAG, "AXP2101 initialized successfully");
-
+        ESP_LOGI(TAG, "AXP2101 initialized");
         PMU.disableTSPinMeasure();
         PMU.enableBattVoltageMeasure();
         PMU.enableVbusVoltageMeasure();
         PMU.enableSystemVoltageMeasure();
         PMU.enableTemperatureMeasure();
-
         uint16_t batt_mv = PMU.getBattVoltage();
         uint8_t batt_pct = PMU.getBatteryPercent();
-        bool vbus_present = PMU.isVbusIn();
-        bool charging = PMU.isCharging();
-        uint16_t vbus_mv = PMU.getVbusVoltage();
-        uint16_t sys_mv = PMU.getSystemVoltage();
-
         ESP_LOGI(TAG, "Battery: %u mV, %u%%", batt_mv, batt_pct);
-        ESP_LOGI(TAG, "VBUS: %s (%u mV)", vbus_present ? "present" : "absent", vbus_mv);
-        ESP_LOGI(TAG, "System: %u mV", sys_mv);
-        ESP_LOGI(TAG, "Charging: %s", charging ? "yes" : "no");
-
         PMU.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
         PMU.clearIrqStatus();
     }
 
-    /* Check if NTP sync is needed */
+    /* BLE NUS */
+    bt_nus_init();
+    ESP_LOGI(TAG, "BLE NUS initialized");
+
+    /* NTP sync check */
     pcf85063_time_t rtc_now;
     bool rtc_valid = (pcf85063_get_time(&rtc_cfg, &rtc_now) == ESP_OK);
-
     bool need_sync = false;
     if (!rtc_valid || rtc_now.year < 2026) {
         need_sync = true;
-        ESP_LOGI(TAG, "RTC time invalid, needs NTP sync");
     } else {
         struct tm tm = {0};
         tm.tm_year = rtc_now.year - 1900;
@@ -425,54 +554,38 @@ extern "C" void app_main(void)
         tm.tm_sec  = rtc_now.second;
         tm.tm_isdst = -1;
         time_t rtc_epoch = mktime(&tm);
-
         nvs_handle_t nvs;
         if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
             int64_t last_sync = 0;
             nvs_get_i64(nvs, NVS_KEY_NTP_SYNC_TS, &last_sync);
             nvs_close(nvs);
-
             if (last_sync == 0 || (rtc_epoch - last_sync) >= (NTP_RESYNC_DAYS * 86400)) {
                 need_sync = true;
-                ESP_LOGI(TAG, "Last NTP sync was > %d days ago, re-syncing", NTP_RESYNC_DAYS);
-            } else {
-                ESP_LOGI(TAG, "NTP synced recently, skipping");
             }
         } else {
             need_sync = true;
-            ESP_LOGI(TAG, "No NTP sync record found");
         }
     }
-
     if (need_sync) {
         ntp_state = NTP_NEEDED;
-    } else {
-        ntp_state = NTP_NONE;
     }
 
-    /* Start non-blocking WiFi if needed */
+    /* Start WiFi if NTP sync needed */
     if (ntp_state == NTP_NEEDED) {
         wifi_start();
     }
 
-    /* Awake loop: update display every 1s, sync NTP when WiFi connects, hard exit at 5s */
-    ESP_LOGI(TAG, "Awake for %d ms before deep sleep...", AWAKE_TIME_MS);
-    int awake_elapsed = 0;
-    int last_display_update = 0;
+    /* Tasks */
+    xTaskCreatePinnedToCore(button_task, "button", 2560, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(ble_heartbeat_task, "ble_heartbeat", 3072, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(rtc_update_task, "rtc_update", 3072, NULL, 1, NULL, 1);
+    xTaskCreatePinnedToCore(display_manager_task, "display_mgr", 4096, NULL, 1, NULL, 1);
 
-    while (awake_elapsed < AWAKE_TIME_MS) {
-        vTaskDelay(pdMS_TO_TICKS(250));
-        awake_elapsed += 250;
+    ESP_LOGI(TAG, "All tasks started, entering main loop");
 
-        /* Update display every 1 second */
-        if (awake_elapsed - last_display_update >= 1000) {
-            last_display_update = awake_elapsed;
-            bsp_display_lock(0);
-            update_rtc_display();
-            bsp_display_unlock();
-        }
-
-        /* If WiFi just connected, sync NTP */
+    /* Main loop: handle NTP sync completion */
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
         if (ntp_state == NTP_SYNCING) {
             ESP_LOGI(TAG, "WiFi connected, syncing RTC via NTP...");
             sync_rtc_from_ntp();
@@ -481,47 +594,4 @@ extern "C" void app_main(void)
             ESP_LOGI(TAG, "NTP sync complete, WiFi stopped");
         }
     }
-
-    /* Cleanup WiFi if still active (timeout) */
-    if (wifi_inited) {
-        ESP_LOGW(TAG, "Stopping WiFi (no connection or still in progress)");
-        wifi_stop();
-    }
-
-    /* Configure wakeup sources and enter deep sleep */
-    /* Only EXT0 (BOOT button) wakeup — no timer */
-
-    /* Configure GPIO0 as input with pull-up and read its level */
-    gpio_config_t gpio_cfg = {
-        .pin_bit_mask = BIT64(WAKEUP_GPIO),
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&gpio_cfg));
-
-    int gpio0_level = gpio_get_level(WAKEUP_GPIO);
-    ESP_LOGI(TAG, "GPIO0 level before sleep: %d (%s)", gpio0_level,
-             gpio0_level == 0 ? "LOW -> will wake immediately!" : "HIGH -> OK, needs press");
-
-    /* EXT0 wakeup: RTC-controlled GPIO, survives deep sleep more reliably */
-    ESP_LOGI(TAG, "Configuring GPIO0 as EXT0 wakeup (low-level trigger)");
-    esp_sleep_enable_ext0_wakeup(WAKEUP_GPIO, 0);
-
-    /* Turn off display before deep sleep */
-    ESP_LOGI(TAG, "Turning off display...");
-    bsp_display_lock(0);
-    lv_obj_t *scr = lv_screen_active();
-    lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
-    lv_obj_clean(lv_screen_active());
-    bsp_display_unlock();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    bsp_display_backlight_off();
-
-    ESP_LOGI(TAG, "Entering deep sleep. Press BOOT (GPIO0) to wake up.");
-    ESP_LOGI(TAG, "========================================");
-
-    fflush(stdout);
-    esp_deep_sleep_start();
 }
