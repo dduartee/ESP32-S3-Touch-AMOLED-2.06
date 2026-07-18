@@ -107,20 +107,28 @@ bt_nus_gatt_handler(uint16_t conn_handle, uint16_t attr_handle,
 
     if (ctxt->op == BLE_GATT_ACCESS_OP_WRITE_CHR) {
         size_t len = OS_MBUF_PKTLEN(ctxt->om);
+        ESP_LOGI(TAG, "NUS RX: len=%u conn=%u attr=%u", (unsigned)len, conn_handle, attr_handle);
         if (len > 0) {
             char *buf = malloc(len + 1);
             if (buf) {
                 memcpy(buf, ctxt->om->om_data, len);
                 buf[len] = 0;
-                ESP_LOGI(TAG, "NUS RX: %s", buf);
+                ESP_LOGI(TAG, "NUS RX content: '%s' (len=%u)", buf, (unsigned)len);
                 printf("[NUS RX] %s\n", buf);
                 size_t copy_len = len < sizeof(last_rx_buf) ? len : sizeof(last_rx_buf) - 1;
                 memcpy(last_rx_buf, buf, copy_len);
                 last_rx_buf[copy_len] = '\0';
                 last_rx_valid = true;
+                ESP_LOGD(TAG, "NUS RX: stored in last_rx_buf (copy_len=%u, valid=true)", (unsigned)copy_len);
                 free(buf);
+            } else {
+                ESP_LOGE(TAG, "NUS RX: malloc FAILED for %u bytes", (unsigned)(len + 1));
             }
+        } else {
+            ESP_LOGW(TAG, "NUS RX: empty write (len=0)");
         }
+    } else {
+        ESP_LOGD(TAG, "NUS GATT op=%d (not WRITE_CHR)", ctxt->op);
     }
 
     return 0;
@@ -136,31 +144,39 @@ bt_nus_gap_event(struct ble_gap_event *event, void *arg)
     switch (event->type) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
-            ESP_LOGI(TAG, "BLE client connected");
+            ESP_LOGI(TAG, "BLE client connected (conn_handle=%u)", event->connect.conn_handle);
             rc = ble_gap_conn_find(event->connect.conn_handle, &desc);
             if (rc == 0) {
                 conn_handle = event->connect.conn_handle;
                 connected = true;
+                ESP_LOGI(TAG, "BLE connection state: conn_handle=%u connected=true", conn_handle);
+            } else {
+                ESP_LOGE(TAG, "BLE conn_find failed after connect: rc=%d", rc);
             }
         } else {
-            ESP_LOGW(TAG, "BLE connection failed, status=%d", event->connect.status);
+            ESP_LOGW(TAG, "BLE connection failed, status=%d, restarting advertise", event->connect.status);
             bt_nus_advertise();
         }
         return 0;
 
     case BLE_GAP_EVENT_DISCONNECT:
-        ESP_LOGI(TAG, "BLE client disconnected, reason=%d", event->disconnect.reason);
+        ESP_LOGI(TAG, "BLE client disconnected (reason=%d, was_conn=%u)",
+                 event->disconnect.reason, conn_handle);
         connected    = false;
         subscribed   = false;
+        conn_handle  = 0;
+        ESP_LOGI(TAG, "BLE state reset: connected=false subscribed=false conn_handle=0");
         bt_nus_advertise();
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:
-        ESP_LOGI(TAG, "subscribe event conn=%x attr=%x cur_notify=%d",
+        ESP_LOGI(TAG, "subscribe event conn=%u attr=%u prev_notify=%d cur_notify=%d",
                  event->subscribe.conn_handle,
                  event->subscribe.attr_handle,
+                 event->subscribe.prev_notify,
                  event->subscribe.cur_notify);
         subscribed = event->subscribe.cur_notify ? true : false;
+        ESP_LOGI(TAG, "subscribed = %d", (int)subscribed);
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -307,21 +323,28 @@ bt_nus_is_connected(void)
 int
 bt_nus_send(const uint8_t *data, size_t len)
 {
+    ESP_LOGD(TAG, "bt_nus_send: len=%u conn=%u sub=%d tx_handle=%u",
+             (unsigned)len, conn_handle, (int)subscribed, nus_tx_val_handle);
     if (!subscribed) {
+        ESP_LOGW(TAG, "bt_nus_send: FAIL - not subscribed");
         return ESP_ERR_INVALID_STATE;
     }
 
     struct os_mbuf *txom = ble_hs_mbuf_from_flat(data, len);
     if (txom == NULL) {
+        ESP_LOGE(TAG, "bt_nus_send: FAIL - ble_hs_mbuf_from_flat returned NULL (len=%u)", (unsigned)len);
         return ESP_ERR_NO_MEM;
     }
 
     int rc = ble_gatts_notify_custom(conn_handle, nus_tx_val_handle, txom);
     if (rc != 0) {
+        ESP_LOGE(TAG, "bt_nus_send: FAIL - ble_gatts_notify_custom rc=%d (conn=%u handle=%u)",
+                 rc, conn_handle, nus_tx_val_handle);
         os_mbuf_free_chain(txom);
         return rc;
     }
 
+    ESP_LOGD(TAG, "bt_nus_send: OK (%u bytes)", (unsigned)len);
     return (int)len;
 }
 
@@ -329,6 +352,7 @@ const char* bt_nus_last_rx(void) {
     if (!last_rx_valid) {
         return NULL;
     }
+    ESP_LOGD(TAG, "bt_nus_last_rx: consuming message '%s'", last_rx_buf);
     last_rx_valid = false;
     return last_rx_buf;
 }

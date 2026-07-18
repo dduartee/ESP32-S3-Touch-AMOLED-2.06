@@ -76,6 +76,8 @@ static lv_obj_t *lbl_battery;
 static uint8_t battery_percent = 0;
 static bool display_on = true;
 static uint32_t display_idle_ms = 0;
+static uint32_t sleep_count = 0;
+static uint32_t wake_count = 0;
 
 static const char *weekday_names[] = {
     "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
@@ -101,11 +103,33 @@ static const char *wakeup_cause_to_str(esp_sleep_wakeup_cause_t cause)
     }
 }
 
+static void log_task_stats(const char *task_name)
+{
+    TaskHandle_t handle = xTaskGetHandle(task_name);
+    if (handle) {
+        UBaseType_t watermark = uxTaskGetStackHighWaterMark(handle);
+        ESP_LOGD(TAG, "  [%s] stack_watermark=%lu bytes free", task_name, (unsigned long)(watermark * sizeof(StackType_t)));
+    }
+}
+
+static void log_display_state(const char *context)
+{
+    ESP_LOGD(TAG, "  [display_state] on=%d idle_ms=%lu sleep_count=%lu wake_count=%lu",
+             display_on, (unsigned long)display_idle_ms,
+             (unsigned long)sleep_count, (unsigned long)wake_count);
+    ESP_LOGD(TAG, "  [lvgl_ptrs] time=%p date=%p status=%p notif=%p batt=%p",
+             (void*)lbl_time, (void*)lbl_date, (void*)lbl_status,
+             (void*)lbl_notification, (void*)lbl_battery);
+    ESP_LOGD(TAG, "  [heap] free=%lu min_free=%lu",
+             (unsigned long)esp_get_free_heap_size(),
+             (unsigned long)esp_get_minimum_free_heap_size());
+}
+
 static int pmu_register_read(uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint8_t len)
 {
     esp_err_t ret = i2c_master_transmit_receive(pmu_dev_handle, &regAddr, 1, data, len, I2C_MASTER_TIMEOUT_MS);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "PMU read failed (reg 0x%02x)", regAddr);
+        ESP_LOGE(TAG, "PMU read failed (reg 0x%02x): %s", regAddr, esp_err_to_name(ret));
         return -1;
     }
     return 0;
@@ -114,7 +138,10 @@ static int pmu_register_read(uint8_t devAddr, uint8_t regAddr, uint8_t *data, ui
 static int pmu_register_write_byte(uint8_t devAddr, uint8_t regAddr, uint8_t *data, uint8_t len)
 {
     uint8_t *buffer = (uint8_t *)malloc(len + 1);
-    if (!buffer) return -1;
+    if (!buffer) {
+        ESP_LOGE(TAG, "PMU write: malloc failed for %u bytes", len + 1);
+        return -1;
+    }
     buffer[0] = regAddr;
     memcpy(buffer + 1, data, len);
 
@@ -122,7 +149,7 @@ static int pmu_register_write_byte(uint8_t devAddr, uint8_t regAddr, uint8_t *da
     free(buffer);
 
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "PMU write failed (reg 0x%02x)", regAddr);
+        ESP_LOGE(TAG, "PMU write failed (reg 0x%02x): %s", regAddr, esp_err_to_name(ret));
         return -1;
     }
     return 0;
@@ -135,6 +162,7 @@ static esp_err_t i2c_init_pmu(void)
         ESP_LOGE(TAG, "BSP I2C bus not available");
         return ESP_FAIL;
     }
+    ESP_LOGI(TAG, "I2C bus handle: %p", (void*)bsp_bus);
 
     i2c_device_config_t dev_config = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
@@ -146,7 +174,12 @@ static esp_err_t i2c_init_pmu(void)
         }
     };
 
-    ESP_ERROR_CHECK(i2c_master_bus_add_device(bsp_bus, &dev_config, &pmu_dev_handle));
+    esp_err_t ret = i2c_master_bus_add_device(bsp_bus, &dev_config, &pmu_dev_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "PMU I2C add_device failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    ESP_LOGI(TAG, "PMU I2C device added (addr=0x%02x, handle=%p)", AXP2101_SLAVE_ADDRESS, (void*)pmu_dev_handle);
     return ESP_OK;
 }
 
@@ -154,15 +187,17 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        ESP_LOGI(TAG, "WiFi STA started, connecting...");
         esp_wifi_connect();
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW(TAG, "WiFi disconnected (ntp_state=%d)", ntp_state);
         if (ntp_state == NTP_CONNECTING) {
-            ESP_LOGW(TAG, "WiFi disconnected, retrying...");
+            ESP_LOGI(TAG, "WiFi reconnecting...");
             esp_wifi_connect();
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "WiFi got IP: " IPSTR, IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
         ntp_state = NTP_SYNCING;
     }
@@ -170,8 +205,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 
 static void wifi_start(void)
 {
-    if (wifi_inited) return;
+    if (wifi_inited) {
+        ESP_LOGW(TAG, "WiFi already initialized, skipping");
+        return;
+    }
 
+    ESP_LOGI(TAG, "WiFi init (ssid=%s)...", WIFI_SSID);
     wifi_event_group = xEventGroupCreate();
 
     ESP_ERROR_CHECK(esp_netif_init());
@@ -196,25 +235,31 @@ static void wifi_start(void)
 
     wifi_inited = true;
     ntp_state = NTP_CONNECTING;
-    ESP_LOGI(TAG, "WiFi connecting (non-blocking)...");
+    ESP_LOGI(TAG, "WiFi started, connecting (non-blocking)...");
 }
 
 static void wifi_stop(void)
 {
     if (!wifi_inited) return;
-    esp_wifi_disconnect();
-    esp_wifi_stop();
-    esp_wifi_deinit();
+    ESP_LOGI(TAG, "WiFi stopping...");
+    esp_err_t ret;
+    ret = esp_wifi_disconnect();
+    ESP_LOGD(TAG, "  esp_wifi_disconnect: %s", esp_err_to_name(ret));
+    ret = esp_wifi_stop();
+    ESP_LOGD(TAG, "  esp_wifi_stop: %s", esp_err_to_name(ret));
+    ret = esp_wifi_deinit();
+    ESP_LOGD(TAG, "  esp_wifi_deinit: %s", esp_err_to_name(ret));
     wifi_inited = false;
     if (wifi_event_group) {
         vEventGroupDelete(wifi_event_group);
         wifi_event_group = NULL;
     }
+    ESP_LOGI(TAG, "WiFi stopped");
 }
 
 static esp_err_t sync_rtc_from_ntp(void)
 {
-    ESP_LOGI(TAG, "Syncing time via SNTP...");
+    ESP_LOGI(TAG, "NTP sync start (SNTP)...");
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_init();
@@ -227,6 +272,7 @@ static esp_err_t sync_rtc_from_ntp(void)
         time(&now);
         localtime_r(&now, &timeinfo);
         if (timeinfo.tm_year >= (2026 - 1900)) {
+            ESP_LOGI(TAG, "NTP time received after %d retries", retry);
             break;
         }
         retry++;
@@ -234,7 +280,7 @@ static esp_err_t sync_rtc_from_ntp(void)
     esp_sntp_stop();
 
     if (timeinfo.tm_year < (2026 - 1900)) {
-        ESP_LOGE(TAG, "Failed to get NTP time after %d retries", retry);
+        ESP_LOGE(TAG, "NTP FAILED after %d retries", retry);
         return ESP_FAIL;
     }
 
@@ -251,11 +297,15 @@ static esp_err_t sync_rtc_from_ntp(void)
     rtc_time.month  = timeinfo.tm_mon + 1;
     rtc_time.year   = timeinfo.tm_year + 1900;
 
-    ESP_ERROR_CHECK(pcf85063_set_time(&rtc_cfg, &rtc_time));
+    esp_err_t set_ret = pcf85063_set_time(&rtc_cfg, &rtc_time);
+    if (set_ret != ESP_OK) {
+        ESP_LOGE(TAG, "RTC set_time failed: %s", esp_err_to_name(set_ret));
+        return set_ret;
+    }
 
     pcf85063_time_t verify = {};
     pcf85063_get_time(&rtc_cfg, &verify);
-    ESP_LOGI(TAG, "RTC set to: %04d-%02d-%02d %02d:%02d:%02d",
+    ESP_LOGI(TAG, "RTC verify: %04d-%02d-%02d %02d:%02d:%02d",
              verify.year, verify.month, verify.day,
              verify.hour, verify.minute, verify.second);
 
@@ -264,7 +314,7 @@ static esp_err_t sync_rtc_from_ntp(void)
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
         time_t now;
         time(&now);
-        ESP_LOGI(TAG, "Storing NTP sync timestamp: %lld", (long long)now);
+        ESP_LOGI(TAG, "NVS: storing ntp_sync_ts=%lld", (long long)now);
         nvs_set_i64(nvs, NVS_KEY_NTP_SYNC_TS, now);
         nvs_commit(nvs);
         nvs_close(nvs);
@@ -275,6 +325,7 @@ static esp_err_t sync_rtc_from_ntp(void)
 
 static void create_ui(void)
 {
+    ESP_LOGD(TAG, "create_ui: building LVGL widgets");
     lv_obj_t *scr = lv_screen_active();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), LV_PART_MAIN);
 
@@ -307,12 +358,17 @@ static void create_ui(void)
     lv_obj_set_style_text_font(lbl_battery, &lv_font_montserrat_16, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0x888888), LV_PART_MAIN);
     lv_obj_align(lbl_battery, LV_ALIGN_CENTER, 0, 110);
+
+    ESP_LOGD(TAG, "create_ui: done (time=%p date=%p status=%p notif=%p batt=%p)",
+             (void*)lbl_time, (void*)lbl_date, (void*)lbl_status,
+             (void*)lbl_notification, (void*)lbl_battery);
 }
 
 static void update_rtc_display(void)
 {
     pcf85063_time_t t;
     if (pcf85063_get_time(&rtc_cfg, &t) != ESP_OK) {
+        ESP_LOGW(TAG, "update_rtc: pcf85063_get_time failed");
         return;
     }
 
@@ -325,24 +381,56 @@ static void update_rtc_display(void)
 }
 
 static void display_off_action(void) {
+    ESP_LOGI(TAG, "display_off_action: START (idle_ms=%lu)", (unsigned long)display_idle_ms);
+    log_display_state("before_off");
+
+    ESP_LOGI(TAG, "display_off_action: acquiring LVGL lock...");
     bsp_display_lock(0);
+    ESP_LOGI(TAG, "display_off_action: LVGL lock acquired");
+
+    ESP_LOGI(TAG, "display_off_action: cleaning LVGL objects...");
     lv_obj_clean(lv_screen_active());
+
+    ESP_LOGI(TAG, "display_off_action: nullifying pointers");
     lbl_time = lbl_date = lbl_status = lbl_notification = lbl_battery = NULL;
+
+    ESP_LOGI(TAG, "display_off_action: releasing LVGL lock");
     bsp_display_unlock();
+
     display_on = false;
+    ESP_LOGI(TAG, "display_off_action: display_on=false set");
+
+    ESP_LOGI(TAG, "display_off_action: backlight off...");
     bsp_display_backlight_off();
-    ESP_LOGI(TAG, "Display OFF");
+
+    ESP_LOGI(TAG, "display_off_action: DONE");
+    log_display_state("after_off");
 }
 
 static void display_on_action(void) {
+    ESP_LOGI(TAG, "display_on_action: START");
+    log_display_state("before_on");
+
+    ESP_LOGI(TAG, "display_on_action: backlight on...");
     bsp_display_backlight_on();
+
+    ESP_LOGI(TAG, "display_on_action: acquiring LVGL lock...");
     bsp_display_lock(0);
+    ESP_LOGI(TAG, "display_on_action: LVGL lock acquired");
+
+    ESP_LOGI(TAG, "display_on_action: creating UI...");
     create_ui();
+
+    ESP_LOGI(TAG, "display_on_action: updating RTC display...");
     update_rtc_display();
+
+    ESP_LOGI(TAG, "display_on_action: releasing LVGL lock");
     bsp_display_unlock();
+
     display_on = true;
     display_idle_ms = 0;
-    ESP_LOGI(TAG, "Display ON");
+    ESP_LOGI(TAG, "display_on_action: DONE (display_on=true, idle_ms=0)");
+    log_display_state("after_on");
 }
 
 static void update_status_display(void) {
@@ -354,11 +442,17 @@ static void update_status_display(void) {
 }
 
 static void show_notification(const char *msg) {
-    if (!lbl_notification) return;
+    if (!lbl_notification) {
+        ESP_LOGW(TAG, "show_notification: lbl_notification=NULL, dropping");
+        return;
+    }
+    ESP_LOGD(TAG, "show_notification: '%s'", msg);
     lv_label_set_text(lbl_notification, msg);
 }
 
 static void button_task(void *pv) {
+    ESP_LOGI(TAG, "[button_task] START (gpio=%d, core=%d)", BOOT_WAKEUP_GPIO, xPortGetCoreID());
+
     gpio_config_t btn_cfg = {
         .pin_bit_mask = (1ULL << BOOT_WAKEUP_GPIO),
         .mode = GPIO_MODE_INPUT,
@@ -382,12 +476,19 @@ static void button_task(void *pv) {
                 prev_raw = raw;
                 if (!raw && !pressed) {
                     pressed = true;
-                    ESP_LOGI(TAG, "BOOT button pressed");
+                    ESP_LOGI(TAG, "[button] BOOT pressed (display_on=%d)", display_on);
+                    log_task_stats("button");
                     if (bt_nus_is_connected()) {
+                        ESP_LOGI(TAG, "[button] sending NUS cmd:btn_press");
                         bt_nus_send((const uint8_t *)">cmd:btn_press\n", 15);
+                    } else {
+                        ESP_LOGD(TAG, "[button] BLE not connected, skipping NUS send");
                     }
                     display_on_action();
                 } else if (raw) {
+                    if (pressed) {
+                        ESP_LOGD(TAG, "[button] BOOT released");
+                    }
                     pressed = false;
                 }
             }
@@ -397,64 +498,103 @@ static void button_task(void *pv) {
 }
 
 static void ble_heartbeat_task(void *pv) {
+    ESP_LOGI(TAG, "[heartbeat_task] START (interval=%dms, core=%d)", HEARTBEAT_INTERVAL_MS, xPortGetCoreID());
     uint32_t count = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(HEARTBEAT_INTERVAL_MS));
         count++;
-        if (bt_nus_is_connected()) {
+        bool connected = bt_nus_is_connected();
+        if (connected) {
             char buf[64];
             int len = snprintf(buf, sizeof(buf), ">NUS alive count=%lu\n", (unsigned long)count);
-            bt_nus_send((const uint8_t *)buf, len);
+            esp_err_t send_ret = bt_nus_send((const uint8_t *)buf, len);
+            if (send_ret != ESP_OK) {
+                ESP_LOGW(TAG, "[heartbeat] bt_nus_send FAILED: %s (count=%lu)", esp_err_to_name(send_ret), (unsigned long)count);
+            } else {
+                ESP_LOGD(TAG, "[heartbeat] sent count=%lu len=%d", (unsigned long)count, len);
+            }
+        } else {
+            ESP_LOGD(TAG, "[heartbeat] BLE disconnected, skip (count=%lu)", (unsigned long)count);
         }
+        log_task_stats("ble_heartbeat");
     }
 }
 
 static void display_manager_task(void *pv) {
+    ESP_LOGI(TAG, "[display_mgr] START (idle_timeout=%dms, core=%d)", DISPLAY_IDLE_TIMEOUT_MS, xPortGetCoreID());
     while (1) {
         /* Check for NUS RX messages */
         const char *rx = bt_nus_last_rx();
         if (rx != NULL) {
-            ESP_LOGI(TAG, "Notification: %s", rx);
+            ESP_LOGI(TAG, "[display_mgr] NUS RX: '%s' (display_on=%d)", rx, display_on);
+            log_display_state("nus_rx");
             char display_buf[256];
             snprintf(display_buf, sizeof(display_buf), "%s", rx);
+            ESP_LOGI(TAG, "[display_mgr] acquiring LVGL lock for notification...");
             bsp_display_lock(0);
+            ESP_LOGI(TAG, "[display_mgr] LVGL lock acquired, showing notification");
             show_notification(display_buf);
             bsp_display_unlock();
+            ESP_LOGI(TAG, "[display_mgr] LVGL lock released");
             if (!display_on) {
+                ESP_LOGI(TAG, "[display_mgr] display was OFF, turning ON for notification");
                 display_on_action();
             }
             display_idle_ms = 0;
+            ESP_LOGD(TAG, "[display_mgr] idle_ms reset to 0");
         }
 
         /* Check if display should turn off */
         if (display_on && display_idle_ms >= DISPLAY_IDLE_TIMEOUT_MS) {
+            ESP_LOGI(TAG, "[display_mgr] idle timeout reached (%lu >= %d), turning display OFF",
+                     (unsigned long)display_idle_ms, DISPLAY_IDLE_TIMEOUT_MS);
             display_off_action();
         }
 
         /* If display is off, enter light sleep */
         if (!display_on) {
-            lvgl_port_stop();
+            ESP_LOGI(TAG, "[display_mgr] display OFF, preparing light sleep...");
+            log_display_state("pre_sleep");
+
+            ESP_LOGI(TAG, "[display_mgr] calling lvgl_port_stop()...");
+            esp_err_t stop_ret = lvgl_port_stop();
+            ESP_LOGI(TAG, "[display_mgr] lvgl_port_stop returned: %s", esp_err_to_name(stop_ret));
 
             gpio_wakeup_enable(BOOT_WAKEUP_GPIO, GPIO_INTR_LOW_LEVEL);
             esp_sleep_enable_gpio_wakeup();
             esp_sleep_enable_timer_wakeup(60000000ULL); /* 60s periodic wake */
             esp_sleep_enable_bt_wakeup();
 
-            ESP_LOGI(TAG, "Entering light sleep...");
+            sleep_count++;
+            ESP_LOGI(TAG, "[display_mgr] entering light sleep (sleep #%lu)...", (unsigned long)sleep_count);
+            int64_t sleep_start = esp_timer_get_time();
+
             esp_light_sleep_start();
 
-            lvgl_port_resume();
+            int64_t sleep_end = esp_timer_get_time();
+            int64_t sleep_us = sleep_end - sleep_start;
+            ESP_LOGI(TAG, "[display_mgr] woke from light sleep (slept %lld ms)", sleep_us / 1000);
 
+            ESP_LOGI(TAG, "[display_mgr] calling lvgl_port_resume()...");
+            esp_err_t resume_ret = lvgl_port_resume();
+            ESP_LOGI(TAG, "[display_mgr] lvgl_port_resume returned: %s", esp_err_to_name(resume_ret));
+
+            wake_count++;
             esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
-            ESP_LOGI(TAG, "Woke from light sleep: cause=%d", cause);
+            ESP_LOGI(TAG, "[display_mgr] wake cause=%d (%s) wake #%lu",
+                     cause, wakeup_cause_to_str(cause), (unsigned long)wake_count);
 
             /* Always turn on display on any wake */
+            ESP_LOGI(TAG, "[display_mgr] turning display ON after wake");
             display_on_action();
         }
 
         vTaskDelay(pdMS_TO_TICKS(250));
         if (display_on) {
             display_idle_ms += 250;
+            if (display_idle_ms % 5000 == 0) {
+                ESP_LOGD(TAG, "[display_mgr] idle=%lu/%d ms", (unsigned long)display_idle_ms, DISPLAY_IDLE_TIMEOUT_MS);
+            }
         }
     }
 }
@@ -467,14 +607,25 @@ static void update_battery_display(void) {
 }
 
 static void rtc_update_task(void *pv) {
+    ESP_LOGI(TAG, "[rtc_update] START (core=%d)", xPortGetCoreID());
+    uint32_t update_count = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
         if (display_on && lbl_time) {
+            update_count++;
             bsp_display_lock(0);
-            if (lbl_time) update_rtc_display();
+            if (lbl_time) {
+                update_rtc_display();
+            } else {
+                ESP_LOGW(TAG, "[rtc_update] lbl_time became NULL after lock");
+            }
             if (lbl_status) update_status_display();
             if (lbl_battery) update_battery_display();
             bsp_display_unlock();
+            if (update_count % 30 == 0) {
+                ESP_LOGD(TAG, "[rtc_update] update #%lu done", (unsigned long)update_count);
+                log_task_stats("rtc_update");
+            }
         }
     }
 }
@@ -484,6 +635,8 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "========================================");
     ESP_LOGI(TAG, "  BLE Watch (Light Sleep)");
     ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "app_main: START (core=%d, heap=%lu)",
+             xPortGetCoreID(), (unsigned long)esp_get_free_heap_size());
 
     /* Reset reason */
     esp_reset_reason_t reset_reason = esp_reset_reason();
@@ -500,23 +653,27 @@ extern "C" void app_main(void)
         case ESP_RST_BROWNOUT:   reason_str = "BROWNOUT"; break;
         default:                 reason_str = "UNKNOWN"; break;
     }
-    ESP_LOGI(TAG, "Reset reason: %s", reason_str);
+    ESP_LOGI(TAG, "Reset reason: %s (0x%x)", reason_str, reset_reason);
 
     /* Wakeup cause */
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
     ESP_LOGI(TAG, "Wakeup cause: %s (0x%x)", wakeup_cause_to_str(wakeup_cause), wakeup_cause);
 
     /* Brazil timezone */
+    ESP_LOGI(TAG, "Setting timezone: BRT3");
     setenv("TZ", "BRT3", 1);
     tzset();
 
     /* NVS */
+    ESP_LOGI(TAG, "NVS init...");
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS: erasing and reinit (err=%s)", esp_err_to_name(ret));
         ESP_ERROR_CHECK(nvs_flash_erase());
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
+    ESP_LOGI(TAG, "NVS init OK");
 
     /* Boot counter */
     nvs_handle_t nvs_handle;
@@ -529,37 +686,44 @@ extern "C" void app_main(void)
         ESP_ERROR_CHECK(nvs_commit(nvs_handle));
         nvs_close(nvs_handle);
         ESP_LOGI(TAG, "Boot count: %ld", (long)boot_count);
+    } else {
+        ESP_LOGE(TAG, "NVS open failed: %s", esp_err_to_name(ret));
     }
 
     /* Display */
+    ESP_LOGI(TAG, "bsp_display_start()...");
     bsp_display_start();
-    ESP_LOGI(TAG, "Display initialized");
+    ESP_LOGI(TAG, "Display initialized OK (heap=%lu)", (unsigned long)esp_get_free_heap_size());
 
     /* PMU */
+    ESP_LOGI(TAG, "PMU I2C init...");
     ESP_ERROR_CHECK(i2c_init_pmu());
-    ESP_LOGI(TAG, "PMU I2C device added");
 
     /* RTC */
+    ESP_LOGI(TAG, "PCF85063 RTC init...");
     rtc_cfg.i2c_bus = bsp_i2c_get_handle();
     esp_err_t rtc_ret = pcf85063_init(&rtc_cfg);
     if (rtc_ret != ESP_OK) {
-        ESP_LOGE(TAG, "PCF85063 init failed: %s", esp_err_to_name(rtc_ret));
+        ESP_LOGE(TAG, "PCF85063 init FAILED: %s", esp_err_to_name(rtc_ret));
     } else {
-        ESP_LOGI(TAG, "PCF85063 RTC initialized");
+        ESP_LOGI(TAG, "PCF85063 RTC initialized OK");
     }
 
     /* LVGL UI */
+    ESP_LOGI(TAG, "Creating initial LVGL UI...");
     bsp_display_lock(0);
     create_ui();
     update_rtc_display();
     bsp_display_unlock();
+    ESP_LOGI(TAG, "Initial UI created OK");
 
     /* AXP2101 battery */
+    ESP_LOGI(TAG, "AXP2101 PMU init...");
     XPowersPMU PMU;
     if (!PMU.begin(AXP2101_SLAVE_ADDRESS, pmu_register_read, pmu_register_write_byte)) {
-        ESP_LOGE(TAG, "AXP2101 init failed");
+        ESP_LOGE(TAG, "AXP2101 init FAILED");
     } else {
-        ESP_LOGI(TAG, "AXP2101 initialized");
+        ESP_LOGI(TAG, "AXP2101 initialized OK");
         PMU.disableTSPinMeasure();
         PMU.enableBattVoltageMeasure();
         PMU.enableVbusVoltageMeasure();
@@ -574,14 +738,17 @@ extern "C" void app_main(void)
     }
 
     /* BLE NUS */
+    ESP_LOGI(TAG, "BLE NUS init...");
     bt_nus_init();
-    ESP_LOGI(TAG, "BLE NUS initialized");
+    ESP_LOGI(TAG, "BLE NUS initialized OK");
 
     /* NTP sync check */
+    ESP_LOGI(TAG, "Checking NTP sync need...");
     pcf85063_time_t rtc_now;
     bool rtc_valid = (pcf85063_get_time(&rtc_cfg, &rtc_now) == ESP_OK);
     bool need_sync = false;
     if (!rtc_valid || rtc_now.year < 2026) {
+        ESP_LOGI(TAG, "NTP needed: rtc_valid=%d year=%d", rtc_valid, rtc_now.year);
         need_sync = true;
     } else {
         struct tm tm = {0};
@@ -598,16 +765,21 @@ extern "C" void app_main(void)
             int64_t last_sync = 0;
             nvs_get_i64(nvs, NVS_KEY_NTP_SYNC_TS, &last_sync);
             nvs_close(nvs);
+            ESP_LOGI(TAG, "NTP: last_sync=%lld, rtc_epoch=%lld, diff=%lld days",
+                     (long long)last_sync, (long long)rtc_epoch,
+                     (long long)((rtc_epoch - last_sync) / 86400));
             if (last_sync == 0 || (rtc_epoch - last_sync) >= (NTP_RESYNC_DAYS * 86400)) {
                 need_sync = true;
             }
         } else {
+            ESP_LOGW(TAG, "NTP: NVS read failed, need sync");
             need_sync = true;
         }
     }
     if (need_sync) {
         ntp_state = NTP_NEEDED;
     }
+    ESP_LOGI(TAG, "NTP state: %d (0=none, 1=needed, 2=connecting, 3=syncing, 4=done)", ntp_state);
 
     /* Start WiFi if NTP sync needed */
     if (ntp_state == NTP_NEEDED) {
@@ -615,12 +787,18 @@ extern "C" void app_main(void)
     }
 
     /* Tasks */
+    ESP_LOGI(TAG, "Creating tasks...");
     xTaskCreatePinnedToCore(button_task, "button", 2560, NULL, 1, NULL, 1);
+    ESP_LOGI(TAG, "  button_task created (prio=1, core=1, stack=2560)");
     xTaskCreatePinnedToCore(ble_heartbeat_task, "ble_heartbeat", 3072, NULL, 1, NULL, 1);
+    ESP_LOGI(TAG, "  ble_heartbeat_task created (prio=1, core=1, stack=3072)");
     xTaskCreatePinnedToCore(rtc_update_task, "rtc_update", 3072, NULL, 1, NULL, 1);
+    ESP_LOGI(TAG, "  rtc_update_task created (prio=1, core=1, stack=3072)");
     xTaskCreatePinnedToCore(display_manager_task, "display_mgr", 4096, NULL, 1, NULL, 1);
+    ESP_LOGI(TAG, "  display_mgr_task created (prio=1, core=1, stack=4096)");
 
-    ESP_LOGI(TAG, "All tasks started, entering main loop");
+    ESP_LOGI(TAG, "All tasks started. heap=%lu", (unsigned long)esp_get_free_heap_size());
+    log_display_state("app_main_done");
 
     /* Main loop: handle NTP sync completion */
     int wifi_elapsed_ms = 0;
@@ -629,13 +807,13 @@ extern "C" void app_main(void)
         wifi_elapsed_ms += 1000;
 
         if (ntp_state == NTP_SYNCING) {
-            ESP_LOGI(TAG, "WiFi connected, syncing RTC via NTP...");
+            ESP_LOGI(TAG, "[main_loop] WiFi connected, starting NTP sync...");
             sync_rtc_from_ntp();
             wifi_stop();
             ntp_state = NTP_DONE;
-            ESP_LOGI(TAG, "NTP sync complete, WiFi stopped");
+            ESP_LOGI(TAG, "[main_loop] NTP sync DONE, WiFi stopped");
         } else if (ntp_state == NTP_CONNECTING && wifi_elapsed_ms >= WIFI_TIMEOUT_MS) {
-            ESP_LOGW(TAG, "WiFi connection timeout, stopping WiFi");
+            ESP_LOGW(TAG, "[main_loop] WiFi TIMEOUT after %d ms, stopping", wifi_elapsed_ms);
             wifi_stop();
             ntp_state = NTP_DONE;
         }
