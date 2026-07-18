@@ -70,6 +70,7 @@ static lv_obj_t *lbl_time;
 static lv_obj_t *lbl_date;
 static lv_obj_t *lbl_status;
 static lv_obj_t *lbl_notification = NULL;
+static lv_obj_t *lbl_battery;
 
 static bool display_on = true;
 static uint32_t display_idle_ms = 0;
@@ -298,6 +299,12 @@ static void create_ui(void)
     lv_obj_set_style_text_font(lbl_notification, &lv_font_montserrat_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(lbl_notification, lv_color_hex(0x00FF00), LV_PART_MAIN);
     lv_obj_align(lbl_notification, LV_ALIGN_CENTER, 0, 80);
+
+    lbl_battery = lv_label_create(scr);
+    lv_label_set_text(lbl_battery, "Battery: --%");
+    lv_obj_set_style_text_font(lbl_battery, &lv_font_montserrat_16, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lbl_battery, lv_color_hex(0x888888), LV_PART_MAIN);
+    lv_obj_align(lbl_battery, LV_ALIGN_CENTER, 0, 110);
 }
 
 static void update_rtc_display(void)
@@ -316,11 +323,11 @@ static void update_rtc_display(void)
 }
 
 static void display_off_action(void) {
+    display_on = false;
     bsp_display_lock(0);
     lv_obj_clean(lv_screen_active());
     bsp_display_unlock();
     bsp_display_backlight_off();
-    display_on = false;
     ESP_LOGI(TAG, "Display OFF");
 }
 
@@ -407,7 +414,9 @@ static void display_manager_task(void *pv) {
             ESP_LOGI(TAG, "Notification: %s", rx);
             char display_buf[256];
             snprintf(display_buf, sizeof(display_buf), "%s", rx);
+            bsp_display_lock(0);
             show_notification(display_buf);
+            bsp_display_unlock();
             if (!display_on) {
                 display_on_action();
             }
@@ -424,6 +433,7 @@ static void display_manager_task(void *pv) {
             gpio_wakeup_enable(BOOT_WAKEUP_GPIO, GPIO_INTR_LOW_LEVEL);
             esp_sleep_enable_gpio_wakeup();
             esp_sleep_enable_timer_wakeup(60000000ULL); /* 60s periodic wake */
+            esp_sleep_enable_bt_wakeup();
 
             ESP_LOGI(TAG, "Entering light sleep...");
             esp_light_sleep_start();
@@ -462,7 +472,20 @@ extern "C" void app_main(void)
 
     /* Reset reason */
     esp_reset_reason_t reset_reason = esp_reset_reason();
-    ESP_LOGI(TAG, "Reset reason: %d", reset_reason);
+    const char *reason_str;
+    switch (reset_reason) {
+        case ESP_RST_POWERON:    reason_str = "POWERON"; break;
+        case ESP_RST_EXT:        reason_str = "EXT"; break;
+        case ESP_RST_SW:         reason_str = "SW"; break;
+        case ESP_RST_PANIC:      reason_str = "PANIC"; break;
+        case ESP_RST_INT_WDT:    reason_str = "INT_WDT"; break;
+        case ESP_RST_TASK_WDT:   reason_str = "TASK_WDT"; break;
+        case ESP_RST_WDT:        reason_str = "WDT"; break;
+        case ESP_RST_DEEPSLEEP:  reason_str = "DEEPSLEEP"; break;
+        case ESP_RST_BROWNOUT:   reason_str = "BROWNOUT"; break;
+        default:                 reason_str = "UNKNOWN"; break;
+    }
+    ESP_LOGI(TAG, "Reset reason: %s", reason_str);
 
     /* Wakeup cause */
     esp_sleep_wakeup_cause_t wakeup_cause = esp_sleep_get_wakeup_cause();
@@ -584,14 +607,21 @@ extern "C" void app_main(void)
     ESP_LOGI(TAG, "All tasks started, entering main loop");
 
     /* Main loop: handle NTP sync completion */
+    int wifi_elapsed_ms = 0;
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
+        wifi_elapsed_ms += 1000;
+
         if (ntp_state == NTP_SYNCING) {
             ESP_LOGI(TAG, "WiFi connected, syncing RTC via NTP...");
             sync_rtc_from_ntp();
             wifi_stop();
             ntp_state = NTP_DONE;
             ESP_LOGI(TAG, "NTP sync complete, WiFi stopped");
+        } else if (ntp_state == NTP_CONNECTING && wifi_elapsed_ms >= WIFI_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "WiFi connection timeout, stopping WiFi");
+            wifi_stop();
+            ntp_state = NTP_DONE;
         }
     }
 }
