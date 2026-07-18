@@ -370,13 +370,6 @@ static void display_off_action(void) {
     ESP_LOGI(TAG, "display_off_action: cleaning LVGL objects...");
     lv_obj_clean(lv_screen_active());
 
-    ESP_LOGI(TAG, "display_off_action: filling screen black...");
-    lv_obj_set_style_bg_color(lv_screen_active(), lv_color_black(), LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(lv_screen_active(), LV_OPA_COVER, LV_PART_MAIN);
-
-    ESP_LOGI(TAG, "display_off_action: forcing LVGL flush...");
-    lv_refr_now(NULL);
-
     ESP_LOGI(TAG, "display_off_action: nullifying pointers");
     lbl_time = lbl_date = lbl_status = lbl_notification = lbl_battery = NULL;
 
