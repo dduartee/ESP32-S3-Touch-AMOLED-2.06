@@ -72,6 +72,7 @@ static lv_obj_t *lbl_status;
 static lv_obj_t *lbl_notification = NULL;
 static lv_obj_t *lbl_battery;
 
+static uint8_t battery_percent = 0;
 static bool display_on = true;
 static uint32_t display_idle_ms = 0;
 
@@ -452,6 +453,13 @@ static void display_manager_task(void *pv) {
     }
 }
 
+static void update_battery_display(void) {
+    if (!lbl_battery) return;
+    char buf[32];
+    snprintf(buf, sizeof(buf), "Battery: %u%%", battery_percent);
+    lv_label_set_text(lbl_battery, buf);
+}
+
 static void rtc_update_task(void *pv) {
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(1000));
@@ -459,6 +467,7 @@ static void rtc_update_task(void *pv) {
             bsp_display_lock(0);
             update_rtc_display();
             update_status_display();
+            update_battery_display();
             bsp_display_unlock();
         }
     }
@@ -552,6 +561,7 @@ extern "C" void app_main(void)
         PMU.enableTemperatureMeasure();
         uint16_t batt_mv = PMU.getBattVoltage();
         uint8_t batt_pct = PMU.getBatteryPercent();
+        battery_percent = batt_pct;
         ESP_LOGI(TAG, "Battery: %u mV, %u%%", batt_mv, batt_pct);
         PMU.disableIRQ(XPOWERS_AXP2101_ALL_IRQ);
         PMU.clearIrqStatus();
