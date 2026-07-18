@@ -34,6 +34,9 @@ static          uint16_t  nus_tx_val_handle  = 0;
 static          uint16_t  conn_handle        = 0;
 static          uint8_t   own_addr_type;
 
+static char            last_rx_buf[256];
+static _Atomic bool    last_rx_valid = false;
+
 static int  bt_nus_gap_event(struct ble_gap_event *event, void *arg);
 static int  bt_nus_gatt_handler(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg);
@@ -111,6 +114,10 @@ bt_nus_gatt_handler(uint16_t conn_handle, uint16_t attr_handle,
                 buf[len] = 0;
                 ESP_LOGI(TAG, "NUS RX: %s", buf);
                 printf("[NUS RX] %s\n", buf);
+                size_t copy_len = len < sizeof(last_rx_buf) ? len : sizeof(last_rx_buf) - 1;
+                memcpy(last_rx_buf, buf, copy_len);
+                last_rx_buf[copy_len] = '\0';
+                last_rx_valid = true;
                 free(buf);
             }
         }
@@ -316,6 +323,14 @@ bt_nus_send(const uint8_t *data, size_t len)
     }
 
     return (int)len;
+}
+
+const char* bt_nus_last_rx(void) {
+    if (!last_rx_valid) {
+        return NULL;
+    }
+    last_rx_valid = false;
+    return last_rx_buf;
 }
 
 static int
