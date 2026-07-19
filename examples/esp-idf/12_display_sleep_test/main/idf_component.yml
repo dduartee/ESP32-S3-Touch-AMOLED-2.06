@@ -1,8 +1,0 @@
-dependencies:
-  waveshare/esp32_s3_touch_amoled_2_06:
-    git: https://github.com/waveshareteam/Waveshare-ESP32-components.git
-    path: bsp/esp32_s3_touch_amoled_2_06
-    version: "*"
-  lvgl/lvgl:
-    version: "9.5.0"
-    public: true
