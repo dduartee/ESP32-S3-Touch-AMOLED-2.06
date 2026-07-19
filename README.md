@@ -72,6 +72,11 @@ the distinction between the two sources.
 | [04_Immersive_block](examples/esp-idf/04_Immersive_block/) | Motion-driven LVGL block demo |
 | [05_Spec_Analyzer](examples/esp-idf/05_Spec_Analyzer/) | Microphone spectrum analyzer |
 | [06_videoplayer](examples/esp-idf/06_videoplayer/) | SD card video playback with audio |
+| [07_imu_sensor](examples/esp-idf/07_imu_sensor/) | IMU sensor dashboard with real-time data |
+| [08_rtc_clock](examples/esp-idf/08_rtc_clock/) | PCF85063 RTC clock with LVGL display |
+| [09_basic_watch](examples/esp-idf/09_basic_watch/) | Basic smartwatch with RTC, display, WiFi NTP sync |
+| [09_deep_sleep_boot](examples/esp-idf/09_deep_sleep_boot/) | Deep sleep with BOOT button + timer wakeup |
+| [10_ble_nus](examples/esp-idf/10_ble_nus/) | BLE NUS (Nordic UART Service) peripheral |
 
 ### Arduino
 
