@@ -1,0 +1,17 @@
+{
+  "idf.flashType": "UART",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3",
+    "OPENOCD_USB_ADAPTER_LOCATION": "3-1"
+  },
+  "clangd.path": "/home/gabrielkduarte/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=/home/gabrielkduarte/Projects/embedded/ESP32-S3-Touch-AMOLED-2.06/examples/esp-idf/09_deep_sleep_boot/build"
+  ],
+  "idf.port": "/dev/ttyACM0"
+}
