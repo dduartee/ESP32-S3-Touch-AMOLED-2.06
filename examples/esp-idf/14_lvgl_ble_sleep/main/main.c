@@ -6,12 +6,14 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_sleep.h"
+#include "esp_heap_caps.h"
 #include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "lvgl.h"
 #include "bsp/esp-bsp.h"
 #include "bt_nus.h"
 #include "power_mgmt.h"
+#include "esp_lvgl_port.h"
 
 static const char *TAG = "ble_lvgl";
 
@@ -83,6 +85,7 @@ static void display_task(void *pvParameters)
     lv_obj_align(sleep_label, LV_ALIGN_BOTTOM_MID, 0, -20);
 
     bsp_display_unlock();
+    pm_set_light_sleep(true);
 
     ble_rx_msg_t msg;
     bool prev_connected = false;
@@ -93,16 +96,23 @@ static void display_task(void *pvParameters)
         if (connected != prev_connected) {
             prev_connected = connected;
             if (connected && sleeping) {
+                ESP_LOGI(TAG, "BLE connected while sleeping, waking display "
+                         "(heap=%lu dma=%lu)",
+                         esp_get_free_heap_size(),
+                         heap_caps_get_free_size(MALLOC_CAP_DMA));
                 display_sleep_exit();
+                lvgl_port_resume();
                 sleeping = false;
                 idle_secs = 0;
             }
+            ESP_LOGI(TAG, "Updating connection label (connected=%d)...", connected);
             bsp_display_lock(0);
             lv_label_set_text(conn_label,
                               connected ? "Conectado" : "Aguardando BLE...");
             lv_obj_set_style_text_color(conn_label,
                 connected ? lv_color_hex(0x00FF88) : lv_color_hex(0xFF4444), 0);
             bsp_display_unlock();
+            ESP_LOGI(TAG, "Connection label updated");
         }
 
         if (xQueueReceive(ble_rx_queue, &msg, pdMS_TO_TICKS(1000)) == pdTRUE) {
@@ -111,13 +121,20 @@ static void display_task(void *pvParameters)
                      msg.len, msg.len, (const char *)msg.data);
 
             if (sleeping) {
+                ESP_LOGI(TAG, "BLE data while sleeping, waking display "
+                         "(heap=%lu dma=%lu)",
+                         esp_get_free_heap_size(),
+                         heap_caps_get_free_size(MALLOC_CAP_DMA));
                 display_sleep_exit();
+                lvgl_port_resume();
                 sleeping = false;
             }
 
+            ESP_LOGI(TAG, "Updating RX label...");
             bsp_display_lock(0);
             lv_label_set_text(rx_label, (const char *)msg.data);
             bsp_display_unlock();
+            ESP_LOGI(TAG, "RX label updated");
             idle_secs = 0;
         } else {
             if (!sleeping) {
@@ -135,13 +152,20 @@ static void display_task(void *pvParameters)
         }
 
         if (!sleeping && !connected && idle_secs >= SLEEP_TIMEOUT_S) {
-            ESP_LOGI(TAG, "Idle timeout -- entering display sleep");
+            ESP_LOGI(TAG, "Idle timeout -- entering display sleep "
+                     "(heap=%lu dma=%lu)",
+                     esp_get_free_heap_size(),
+                     heap_caps_get_free_size(MALLOC_CAP_DMA));
 
+            // 1. Render small label update WHILE LVGL is running (no full-screen flush)
             bsp_display_lock(0);
             lv_label_set_text(sleep_label, "Display sleeping...");
-            lv_obj_set_style_bg_color(lv_scr_act(), lv_color_hex(0x000000), 0);
             bsp_display_unlock();
-            vTaskDelay(pdMS_TO_TICKS(150));
+            vTaskDelay(pdMS_TO_TICKS(250));
+
+            // 2. Now stop LVGL (no pending renders)
+            lvgl_port_stop();
+            vTaskDelay(pdMS_TO_TICKS(100));
 
             display_sleep_enter();
             sleeping = true;
@@ -170,7 +194,6 @@ void app_main(void)
         ESP_LOGE(TAG, "bsp_display_start failed");
         return;
     }
-
     ESP_ERROR_CHECK(display_sleep_init(disp));
 
     ble_rx_queue = xQueueCreate(BLE_RX_QUEUE_SIZE, sizeof(ble_rx_msg_t));
@@ -182,7 +205,11 @@ void app_main(void)
     bt_nus_set_rx_callback(ble_rx_callback);
     bt_nus_init();
 
+#ifdef CONFIG_PM_ENABLE
     ESP_ERROR_CHECK(pm_configure_auto_light_sleep());
+#else
+    ESP_LOGI(TAG, "PM_ENABLE=n -- auto light sleep DISABLED (modem sleep only)");
+#endif
 
     xTaskCreatePinnedToCore(display_task, "display", 4096, NULL, 2, NULL, 1);
 
